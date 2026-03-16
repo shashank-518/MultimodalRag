@@ -1,0 +1,9 @@
+ollama
+chromadb
+PyMuPDF
+python-docx
+pytesseract
+Pillow
+streamlit
+tqdm
+openai-whisper
