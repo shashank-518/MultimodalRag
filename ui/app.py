@@ -1,18 +1,20 @@
 """
 ui/app.py
-Run: streamlit run ui/app.py
+Run: streamlit run app.py
 
 Requirements:
   - ollama serve  (keep running in background)
   - ollama pull mistral
+  - ffmpeg installed and on PATH  (for video audio extraction)
+  - tesseract installed            (for image/frame OCR)
 """
 
-import sys, os, shutil
+import sys, os, shutil, tempfile
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import streamlit as st
-import ollama # type: ignore
-from ingestion.ingestor     import ingest_file
+import ollama  # type: ignore
+from ingestion.ingestor      import ingest_file
 from embeddings.vector_store import VectorStore
 from retrieval.query_engine  import QueryEngine
 
@@ -37,10 +39,8 @@ html,body,.stApp{background:var(--bg)!important;font-family:'DM Sans',sans-serif
 .block-container{padding:2rem 2.5rem 6rem!important;max-width:880px!important;margin:0 auto!important;}
 [data-testid="stSidebar"]{background:var(--surf)!important;border-right:1px solid var(--border)!important;}
 [data-testid="stSidebar"]>div:first-child{padding:24px 18px!important;}
-[data-testid="stSidebar"] label,
-[data-testid="stSidebar"] p,
-[data-testid="stSidebar"] span,
-[data-testid="stSidebar"] div{color:var(--t2)!important;}
+[data-testid="stSidebar"] label,[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span,[data-testid="stSidebar"] div{color:var(--t2)!important;}
 [data-testid="stSelectbox"]>div>div{background:var(--surf2)!important;border:1px solid var(--border)!important;border-radius:10px!important;color:var(--t1)!important;}
 [data-testid="stFileUploader"]{background:var(--surf2)!important;border:1.5px dashed var(--border)!important;border-radius:12px!important;}
 [data-testid="stFileUploader"] *{color:var(--t2)!important;}
@@ -75,9 +75,8 @@ hr{border-color:var(--border)!important;}
 .f-row{display:flex;align-items:center;gap:7px;padding:7px 0;border-bottom:1px solid var(--border);font-size:0.8rem;color:var(--t2)!important;overflow:hidden;}
 .f-badge{font-size:0.65rem;font-weight:700;padding:2px 6px;border-radius:5px;flex-shrink:0;}
 .b-pdf {background:rgba(255,107,107,.15);color:#ff6b6b!important;border:1px solid rgba(255,107,107,.3);}
-.b-docx{background:rgba(61,220,151,.12); color:#3ddc97!important;border:1px solid rgba(61,220,151,.3);}
 .b-img {background:rgba(255,181,71,.12); color:#ffb547!important;border:1px solid rgba(255,181,71,.3);}
-.b-aud {background:rgba(108,99,255,.15); color:#a29bfe!important;border:1px solid rgba(108,99,255,.3);}
+.b-vid {background:rgba(108,99,255,.15); color:#a29bfe!important;border:1px solid rgba(108,99,255,.3);}
 .chunk-card{background:var(--bg);border:1px solid var(--border);border-radius:9px;padding:11px 13px;margin:5px 0;font-size:0.79rem;color:var(--t2)!important;line-height:1.55;}
 .chunk-card strong{color:var(--t1)!important;}
 .s-tag{display:inline-block;background:rgba(108,99,255,.15);color:var(--accent)!important;border:1px solid rgba(108,99,255,.3);border-radius:5px;padding:1px 7px;font-size:0.7rem;font-weight:600;margin-left:5px;}
@@ -90,7 +89,23 @@ hr{border-color:var(--border)!important;}
 """, unsafe_allow_html=True)
 
 
+# ── File type sets ────────────────────────────────────
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp"}
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv"}
+
+
 # ── Diagnostics ───────────────────────────────────────
+
+def _model_names(models_response) -> list:
+    names = []
+    for m in models_response.get("models", []):
+        if isinstance(m, dict):
+            names.append(m.get("name", "") or m.get("model", ""))
+        else:
+            names.append(getattr(m, "model", None) or getattr(m, "name", ""))
+    return names
+
 
 def run_diagnostics():
     results = {}
@@ -104,7 +119,7 @@ def run_diagnostics():
 
     # Mistral model
     try:
-        available = [m["name"] for m in ollama.list().get("models", [])]
+        available = _model_names(ollama.list())
         found = any("mistral" in m for m in available)
         results["Mistral model"] = (found, "ready ✓" if found else "run: ollama pull mistral")
     except Exception:
@@ -112,17 +127,10 @@ def run_diagnostics():
 
     # PyMuPDF
     try:
-        import fitz # type: ignore
+        import fitz  # type: ignore
         results["PDF  (PyMuPDF)"] = (True, "installed ✓")
     except ImportError:
         results["PDF  (PyMuPDF)"] = (False, "pip install PyMuPDF")
-
-    # python-docx
-    try:
-        from docx import Document # type: ignore
-        results["DOCX (python-docx)"] = (True, "installed ✓")
-    except ImportError:
-        results["DOCX (python-docx)"] = (False, "pip install python-docx")
 
     # Pillow
     try:
@@ -133,14 +141,14 @@ def run_diagnostics():
 
     # pytesseract binding
     try:
-        import pytesseract # type: ignore
+        import pytesseract  # type: ignore
         results["IMG  (pytesseract)"] = (True, "installed ✓")
     except ImportError:
         results["IMG  (pytesseract)"] = (False, "pip install pytesseract")
 
     # Tesseract binary
     try:
-        import pytesseract # type: ignore
+        import pytesseract  # type: ignore
         pytesseract.get_tesseract_version()
         results["IMG  (Tesseract binary)"] = (True, "found ✓")
     except Exception:
@@ -150,29 +158,37 @@ def run_diagnostics():
             "  Linux:   sudo apt install tesseract-ocr\n"
             "  Mac:     brew install tesseract")
 
+    # OpenCV
+    try:
+        import cv2  # type: ignore
+        results["VID  (opencv-python)"] = (True, "installed ✓")
+    except ImportError:
+        results["VID  (opencv-python)"] = (False, "pip install opencv-python")
+
+    # ffmpeg binary
+    results["VID  (ffmpeg binary)"] = (
+        shutil.which("ffmpeg") is not None,
+        "found ✓" if shutil.which("ffmpeg") else
+        "Install ffmpeg:\n"
+        "  Windows: https://ffmpeg.org/download.html\n"
+        "  Linux:   sudo apt install ffmpeg\n"
+        "  Mac:     brew install ffmpeg"
+    )
+
     # openai-whisper
     try:
-        import whisper # type: ignore
-        results["AUD  (whisper)"] = (True, "installed ✓")
+        import whisper  # type: ignore
+        results["VID  (whisper)"] = (True, "installed ✓")
     except ImportError:
-        results["AUD  (whisper)"] = (False, "pip install openai-whisper")
-
-    # ffmpeg
-    if shutil.which("ffmpeg"):
-        results["AUD  (ffmpeg)"] = (True, "found ✓")
-    else:
-        results["AUD  (ffmpeg)"] = (False,
-            "Install ffmpeg:\n"
-            "  Windows: https://ffmpeg.org/download.html (add to PATH)\n"
-            "  Linux:   sudo apt install ffmpeg\n"
-            "  Mac:     brew install ffmpeg")
+        results["VID  (whisper)"] = (False, "pip install openai-whisper")
 
     return results
 
 
 # ── Session state ─────────────────────────────────────
-# Using session_state instead of cache_resource so that
-# chunk count updates correctly after indexing files.
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
 if "vs" not in st.session_state:
     st.session_state.vs = VectorStore()
@@ -180,132 +196,89 @@ if "vs" not in st.session_state:
 if "qe" not in st.session_state:
     st.session_state.qe = QueryEngine(st.session_state.vs)
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
 vs = st.session_state.vs
 qe = st.session_state.qe
 
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".bmp"}
-AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
 
+# ── Sidebar ───────────────────────────────────────────
 
-# ── SIDEBAR ───────────────────────────────────────────
 with st.sidebar:
+    st.markdown(
+        '<span class="s-label">⚙️ Settings</span>',
+        unsafe_allow_html=True
+    )
 
-    st.markdown("""
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:2px;">
-        <span style="font-size:1.6rem;">🧠</span>
-        <span style="font-family:'Syne',sans-serif;font-weight:700;
-              font-size:1.05rem;color:#f0f2ff!important;">DocMind</span>
-    </div>
-    <p style="font-size:0.72rem;color:#5c6285!important;margin:0 0 4px;">
-        Multimodal RAG &nbsp;·&nbsp; Powered by Mistral
-    </p>
-    """, unsafe_allow_html=True)
-
-    st.divider()
-
-    # Top-K
-    st.markdown('<span class="s-label">Retrieval depth</span>', unsafe_allow_html=True)
-    top_k = st.slider("Chunks", 1, 10, 5, label_visibility="collapsed")
+    top_k = st.selectbox(
+        "Results per query",
+        options=[3, 5, 7, 10],
+        index=1,
+        key="top_k"
+    )
 
     st.divider()
 
     # Diagnostics
-    st.markdown('<span class="s-label">System check</span>', unsafe_allow_html=True)
-    with st.expander("🔍 Check dependencies", expanded=False):
-        diag   = run_diagnostics()
-        all_ok = all(ok for ok, _ in diag.values())
+    with st.expander("🔍 System diagnostics"):
+        diag = run_diagnostics()
         for name, (ok, msg) in diag.items():
-            color = "#3ddc97" if ok else "#ff5c7a"
-            icon  = "✅" if ok else "❌"
-            st.markdown(
-                f'<div style="display:flex;justify-content:space-between;'
-                f'padding:5px 0;border-bottom:1px solid #2a2f42;font-size:0.78rem;">'
-                f'<span style="color:#9ba3c4;">{icon} {name}</span>'
-                f'<span style="color:{color};font-weight:600;">{"OK" if ok else "MISSING"}</span>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-            if not ok:
-                st.code(msg, language=None)
-        if all_ok:
-            st.success("All systems ready!")
-        else:
-            st.warning("Fix missing items above, then restart Streamlit.")
+            icon = "✅" if ok else "❌"
+            st.markdown(f"**{icon} {name}**  \n`{msg}`")
 
     st.divider()
 
     # Upload
-    st.markdown('<span class="s-label">Upload files</span>', unsafe_allow_html=True)
-    st.markdown(
-        '<p style="font-size:0.73rem;color:#5c6285!important;margin:0 0 6px;">'
-        'PDF · DOCX · PNG · JPG · MP3 · WAV</p>',
-        unsafe_allow_html=True
-    )
+    st.markdown('<span class="s-label">📤 Upload files</span>', unsafe_allow_html=True)
 
     uploaded = st.file_uploader(
-        "files", label_visibility="collapsed",
-        type=["pdf","docx","doc","png","jpg","jpeg","tiff","bmp",
-              "mp3","wav","m4a","ogg","flac"],
-        accept_multiple_files=True
+        "PDF, Images, or Video",
+        type=["pdf",
+              "png", "jpg", "jpeg", "tiff", "bmp", "webp",
+              "mp4", "mov", "avi", "mkv", "webm", "flv"],
+        accept_multiple_files=True,
+        label_visibility="collapsed"
     )
 
-    if uploaded:
-        if st.button("⬆  Index files", use_container_width=True):
-            upload_dir = "./data/uploads"
-            os.makedirs(upload_dir, exist_ok=True)
+    if uploaded and st.button("⚡ Index files", use_container_width=True):
+        status        = st.empty()
+        prog          = st.progress(0)
+        total_indexed = 0
 
-            prog          = st.progress(0)
-            status        = st.empty()
-            total_indexed = 0
+        for i, uf in enumerate(uploaded):
+            status.info(f"Processing {uf.name}…")
 
-            for i, uf in enumerate(uploaded):
-                ext = os.path.splitext(uf.name)[1].lower()
-                fp  = os.path.join(upload_dir, uf.name)
+            # Save to temp file preserving extension
+            ext = os.path.splitext(uf.name)[1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                tmp.write(uf.read())
+                fp = tmp.name
 
-                with open(fp, "wb") as f:
-                    f.write(uf.read())
-
-                if not os.path.isfile(fp) or os.path.getsize(fp) == 0:
-                    st.error(f"❌ {uf.name} — file save failed")
-                    prog.progress((i + 1) / len(uploaded))
-                    continue
-
-                if ext in AUDIO_EXTS:
-                    status.info(f"🎙️ Transcribing {uf.name} — may take a minute…")
-                elif ext in IMAGE_EXTS:
-                    status.info(f"🔍 OCR scanning {uf.name}…")
+            try:
+                records = ingest_file(fp)
+                if not records:
+                    st.warning(f"⚠️ {uf.name} — no text extracted.")
                 else:
-                    status.info(f"⏳ Processing {uf.name}…")
+                    vs.add_records(records)
+                    total_indexed += len(records)
+                    st.success(f"✓ {uf.name} — {len(records)} chunks indexed")
+            except EnvironmentError as e:
+                st.error(f"❌ {uf.name}\n{e}")
+            except ImportError as e:
+                st.error(f"❌ {uf.name} — missing library:\n{e}")
+            except RuntimeError as e:
+                st.error(f"❌ {uf.name} — failed:\n{e}")
+            except Exception as e:
+                st.error(f"❌ {uf.name} — {type(e).__name__}: {e}")
+            finally:
+                os.unlink(fp)
 
-                try:
-                    records = ingest_file(fp)
-                    if not records:
-                        st.warning(f"⚠️ {uf.name} — no text extracted. Check diagnostics above.")
-                    else:
-                        vs.add_records(records)
-                        total_indexed += len(records)
-                        st.success(f"✓ {uf.name} — {len(records)} chunks indexed")
+            prog.progress((i + 1) / len(uploaded))
 
-                except EnvironmentError as e:
-                    st.error(f"❌ {uf.name}\n{e}")
-                except ImportError as e:
-                    st.error(f"❌ {uf.name} — missing library:\n{e}")
-                except RuntimeError as e:
-                    st.error(f"❌ {uf.name} — failed:\n{e}")
-                except Exception as e:
-                    st.error(f"❌ {uf.name} — {type(e).__name__}: {e}")
+        if total_indexed > 0:
+            status.success(f"✅ Done! {total_indexed} chunks indexed.")
+        else:
+            status.warning("⚠️ No new chunks were indexed.")
 
-                prog.progress((i + 1) / len(uploaded))
-
-            if total_indexed > 0:
-                status.success(f"✅ Done! {total_indexed} chunks indexed.")
-            else:
-                status.warning("⚠️ No new chunks were indexed.")
-
-            st.rerun()
+        st.rerun()
 
     st.divider()
 
@@ -318,12 +291,10 @@ with st.sidebar:
             ext = os.path.splitext(fname)[1].lower()
             if ext == ".pdf":
                 badge = '<span class="f-badge b-pdf">PDF</span>'
-            elif ext in [".docx", ".doc"]:
-                badge = '<span class="f-badge b-docx">DOC</span>'
             elif ext in IMAGE_EXTS:
                 badge = '<span class="f-badge b-img">IMG</span>'
             else:
-                badge = '<span class="f-badge b-aud">AUD</span>'
+                badge = '<span class="f-badge b-vid">VID</span>'
 
             c1, c2 = st.columns([5, 1])
             short  = fname if len(fname) <= 20 else fname[:18] + "…"
@@ -354,14 +325,13 @@ st.markdown("""
   <div class="hero-icon">🧠</div>
   <div>
     <div class="hero-title">DocMind</div>
-    <div class="hero-sub">Ask questions across PDF, DOCX, Images &amp; Audio — powered by Mistral</div>
+    <div class="hero-sub">Ask questions across PDF, Images &amp; Video — powered by Mistral</div>
   </div>
 </div>
 <div class="pills">
   <span class="pill"><span class="pill-dot" style="background:#ff6b6b"></span>PDF · Page indexed</span>
-  <span class="pill"><span class="pill-dot" style="background:#3ddc97"></span>DOCX · Section indexed</span>
   <span class="pill"><span class="pill-dot" style="background:#ffb547"></span>Images · OCR indexed</span>
-  <span class="pill"><span class="pill-dot" style="background:#a29bfe"></span>Audio · Timestamp indexed</span>
+  <span class="pill"><span class="pill-dot" style="background:#a29bfe"></span>Video · Frame OCR + Audio transcribed</span>
 </div>
 """, unsafe_allow_html=True)
 
@@ -372,7 +342,7 @@ if not st.session_state.chat_history:
         <div class="empty">
           <div class="empty-icon">📂</div>
           <h3>No documents uploaded</h3>
-          <p>Upload files in the sidebar to get started.</p>
+          <p>Upload PDF, images, or video files in the sidebar to get started.</p>
         </div>""", unsafe_allow_html=True)
     else:
         st.markdown("""
@@ -389,7 +359,7 @@ for entry in st.session_state.chat_history:
     with st.chat_message("assistant", avatar="🤖"):
         st.markdown(f'<div class="answer-card">{entry["answer"]}</div>', unsafe_allow_html=True)
         if entry.get("citations"):
-            tags = "".join(f'<span class="cite-tag">📄 {c}</span>' for c in entry["citations"])
+            tags = "".join(f'<span class="cite-tag">{c}</span>' for c in entry["citations"])
             st.markdown(f'<div class="cites">{tags}</div>', unsafe_allow_html=True)
 
 # Chat input
@@ -409,7 +379,7 @@ if question:
             st.markdown(f'<div class="answer-card">{result["answer"]}</div>', unsafe_allow_html=True)
 
             if result.get("citations"):
-                tags = "".join(f'<span class="cite-tag">📄 {c}</span>' for c in result["citations"])
+                tags = "".join(f'<span class="cite-tag">{c}</span>' for c in result["citations"])
                 st.markdown(f'<div class="cites">{tags}</div>', unsafe_allow_html=True)
 
             with st.expander("View retrieved chunks"):

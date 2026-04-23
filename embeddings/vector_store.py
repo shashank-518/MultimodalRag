@@ -1,19 +1,22 @@
 """
 embeddings/vector_store.py
 Uses Mistral via Ollama for embeddings.
-No SentenceTransformers. No HuggingFace. No nomic. Just Mistral.
+Supports PDF, Image, and Video chunk types.
 """
 
 import os
-import ollama # type: ignore
-import chromadb # type: ignore
-from chromadb.config import Settings # type: ignore
+import ollama  # type: ignore
+import chromadb  # type: ignore
+from chromadb.config import Settings  # type: ignore
 from tqdm import tqdm
 
 CHROMA_PATH     = "./data/VectorStore"
 COLLECTION_NAME = "multimodal_rag"
 EMBED_MODEL     = "mistral"
 BATCH_SIZE      = 8
+
+# Video sub-types handled by this store
+VIDEO_TYPES = {"video_frame", "video_audio"}
 
 
 def _embed(text: str) -> list:
@@ -28,10 +31,26 @@ def _embed(text: str) -> list:
         )
 
 
+def _model_names(models_response) -> list[str]:
+    """
+    Normalise the ollama.list() response across old and new SDK versions.
+    Old SDK  → list of dicts  with key 'name'
+    New SDK  → list of Model objects with attribute .model  (or .name)
+    """
+    names = []
+    for m in models_response.get("models", []):
+        if isinstance(m, dict):
+            names.append(m.get("name", "") or m.get("model", ""))
+        else:
+            # pydantic Model object
+            names.append(getattr(m, "model", None) or getattr(m, "name", ""))
+    return names
+
+
 class VectorStore:
 
     def __init__(self):
-        print(f"[VectorStore] Using Mistral embeddings via Ollama...")
+        print(f"[VectorStore] Using Mistral embeddings via Ollama…")
         self._verify_ollama()
 
         os.makedirs(CHROMA_PATH, exist_ok=True)
@@ -47,10 +66,8 @@ class VectorStore:
 
     def _verify_ollama(self):
         try:
-            models    = ollama.list()
-            available = [m["name"] for m in models.get("models", [])]
-            found     = any("mistral" in m for m in available)
-            if found:
+            available = _model_names(ollama.list())
+            if any("mistral" in m for m in available):
                 print("[VectorStore] Mistral ready ✓")
             else:
                 print("[VectorStore] ⚠️  Mistral not found! Run: ollama pull mistral")
@@ -70,7 +87,7 @@ class VectorStore:
             print("[VectorStore] Already indexed — skipping.")
             return 0
 
-        print(f"[VectorStore] Indexing {len(new_records)} chunks...")
+        print(f"[VectorStore] Indexing {len(new_records)} chunks…")
 
         for i in tqdm(range(0, len(new_records), BATCH_SIZE), desc="Indexing"):
             batch      = new_records[i : i + BATCH_SIZE]
@@ -115,16 +132,21 @@ class VectorStore:
             meta  = results["metadatas"][0][i]
             text  = results["documents"][0][i]
             score = round(1 - results["distances"][0][i], 4)
+            ftype = meta.get("file_type", "")
 
-            if meta.get("file_type") == "audio":
-                citation = f"🎙️ {meta['source']} — Timestamp {meta.get('timestamp','?')}"
+            if ftype == "video_frame":
+                citation = f"🎬 {meta['source']} — Frame @ {meta.get('timestamp','?')}"
+            elif ftype == "video_audio":
+                citation = f"🔊 {meta['source']} — Audio @ {meta.get('timestamp','?')}"
+            elif ftype == "image":
+                citation = f"🖼️ {meta['source']} — OCR"
             else:
                 citation = f"📄 {meta['source']} — Page {meta.get('page','?')}"
 
             output.append({
                 "text":      text,
                 "source":    meta.get("source",    ""),
-                "file_type": meta.get("file_type", ""),
+                "file_type": ftype,
                 "page":      meta.get("page"),
                 "timestamp": meta.get("timestamp"),
                 "score":     score,

@@ -1,9 +1,9 @@
 ollama
 chromadb
 PyMuPDF
-python-docx
 pytesseract
 Pillow
+opencv-python
+openai-whisper
 streamlit
 tqdm
-openai-whisper
